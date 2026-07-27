@@ -32,15 +32,15 @@ Four defects, all structural rather than incidental:
 3. **Divergence is invisible and data-losing.** Files created by `run_command` — `bun.lock`, generated migrations, `data/` — exist only in the container until a sync succeeds. They are absent from the host mirror, therefore absent from the git commit taken at end of turn, therefore absent from revisions *and* from the off-box backup that pushes from that mirror.
 4. **Sandbox death is a recovery path rather than a non-event.** `ensure_sandbox` probes liveness by attempting a download, and on `sandbox_is_gone` clears `sandbox_id`, creates a replacement, and `merge_move_all`s the host mirror into it (`lib.rs:2499–2541`). All of that machinery exists to compensate for state being in the wrong place.
 
-### The primitive already exists
+### The primitive is declared but not implemented
 
-`SandboxCreateConfig.workspace_volume` (`crates/temps-agents/src/sandbox/mod.rs:148`) already describes exactly what is needed:
+`SandboxCreateConfig.workspace_volume` (`crates/temps-agents/src/sandbox/mod.rs:151`) describes what is needed:
 
 > When `Some`, mount this Docker named volume at the sandbox work dir instead of bind-mounting `host_work_dir`. The volume is seeded from `host_work_dir` on first use (detected by checking if it's empty) and **retained on sandbox destroy so a follow-up workspace can mount the exact same filesystem.** This is how "Open in workspace" picks up where a failed workflow run left off — including `.git` and any unpushed commits the AI produced.
 
-It is implemented, in production, and exercised: `executor.rs:550` names a volume `temps-wfrun-{run_id}` for workflow runs and persists it to `agent_runs.workspace_volume`, a column that has existed since `m20260417_000003`. The expiration sweeper already documents that volumes survive a stop (`expiration_sweeper.rs:10`), and `destroy` already takes a `purge_volumes` flag.
+**No provider reads this field.** `executor.rs:587` sets it for workflow runs and `run_service.rs:282` persists it to the `agent_runs.workspace_volume` column (present since `m20260417_000003`), but `docker.rs`, `firecracker.rs`, and `local.rs` never consume it — every other occurrence in the tree is `workspace_volume: None` in a test fixture. The doc comment describes intended behavior that was never wired up, so the "Open in workspace" recovery it claims does not currently happen: a volume name is generated and stored, and no volume is created or mounted.
 
-Standalone sandboxes are the only sandbox type that never opts in. The gap is plumbing, not capability.
+The gap is therefore implementation, not plumbing. The field is a useful statement of intent and its name survives in the design below, but the Docker mount path has to be built.
 
 ### Why "just back it up to S3" is not the same decision
 
