@@ -6,7 +6,9 @@ pub mod managed;
 pub mod pty_agent_bundle;
 pub mod routing;
 pub mod user;
+pub mod volume;
 
+pub use volume::{VolumeDriver, VolumeMount, VolumeMountError};
 pub use user::{
     SANDBOX_CHOWN, SANDBOX_GID, SANDBOX_GROUP, SANDBOX_HOME, SANDBOX_UID, SANDBOX_USER,
     SANDBOX_WORK_DIR,
