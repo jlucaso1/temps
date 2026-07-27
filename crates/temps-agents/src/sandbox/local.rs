@@ -300,7 +300,7 @@ mod tests {
             run_id,
             container_name_override: None,
             host_work_dir: work_dir,
-            workspace_volume: None,
+            volumes: Vec::new(),
             image: None,
             cpu_limit: None,
             memory_limit_mb: None,

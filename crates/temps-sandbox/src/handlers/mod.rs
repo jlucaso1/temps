@@ -67,6 +67,8 @@ pub struct SandboxAppState {
     components(schemas(
         sandboxes::CreateSandboxBody,
         sandboxes::SourceBody,
+        sandboxes::VolumeMountBody,
+        sandboxes::VolumeDriverBody,
         sandboxes::SandboxResponse,
         sandboxes::ListSandboxesResponse,
         sandboxes::ExtendTimeoutBody,

@@ -788,7 +788,7 @@ pub async fn smoke_test_agent(
             owner_user_id: Some(auth.user_id()),
             container_name_override: None,
             host_work_dir: work_dir.clone(),
-            workspace_volume: None,
+            volumes: Vec::new(),
             image: Some(image),
             cpu_limit: Some(1.0),
             memory_limit_mb: Some(512),

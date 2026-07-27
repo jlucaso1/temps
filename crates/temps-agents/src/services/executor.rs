@@ -25,7 +25,7 @@ use temps_notifications::types::{Notification, NotificationPriority};
 
 use crate::ai_cli::{AiCliProvider, AiRunConfig, AiRunResult, OnEventCallback};
 use crate::error::AgentError;
-use crate::sandbox::SandboxCreateConfig;
+use crate::sandbox::{SandboxCreateConfig, VolumeMount};
 use crate::services::sandbox_registry::SandboxRegistry;
 use crate::services::secret_service::{SecretService, SecretType};
 
@@ -584,7 +584,7 @@ impl AgentExecutor {
             owner_user_id,
             container_name_override: None,
             host_work_dir: host_work_dir.clone(),
-            workspace_volume: Some(workspace_volume),
+            volumes: vec![VolumeMount::workspace(workspace_volume)],
             image: resolved_image,
             cpu_limit: Some(cpu_limit),
             memory_limit_mb: Some(memory_limit_mb),

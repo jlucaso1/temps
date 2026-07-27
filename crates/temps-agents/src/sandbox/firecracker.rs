@@ -1326,7 +1326,7 @@ mod tests {
             run_id: 7,
             container_name_override: Some("abc123".to_string()),
             host_work_dir: PathBuf::from("/tmp"),
-            workspace_volume: None,
+            volumes: Vec::new(),
             image: None,
             cpu_limit: None,
             memory_limit_mb: None,

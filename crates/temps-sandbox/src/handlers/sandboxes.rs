@@ -369,6 +369,66 @@ pub struct ResourcesBody {
     pub vcpus: Option<f64>,
 }
 
+/// How a volume is realized (ADR-034). `local` is the only driver a
+/// provider currently mounts; `s3` is accepted so callers can express
+/// intent ahead of provider support, and create fails with a clear 400
+/// if the target provider can't honor it yet.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(tag = "driver", rename_all = "lowercase", deny_unknown_fields)]
+pub enum VolumeDriverBody {
+    Local,
+    S3 {
+        bucket: String,
+        #[serde(default)]
+        prefix: Option<String>,
+        credential_ref: String,
+    },
+}
+
+/// One volume to attach at `mount_path` (ADR-034). Temps-native — no
+/// `@vercel/sandbox` equivalent.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VolumeMountBody {
+    /// Volume identifier. Caller-owned: reuse the same name across sandbox
+    /// creates to remount the same underlying storage.
+    pub volume: String,
+    /// Absolute in-container mount point, e.g. `/home/temps/workspace` or
+    /// `/shared`.
+    pub mount_path: String,
+    pub driver: VolumeDriverBody,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+impl From<VolumeDriverBody> for temps_agents::sandbox::VolumeDriver {
+    fn from(d: VolumeDriverBody) -> Self {
+        match d {
+            VolumeDriverBody::Local => temps_agents::sandbox::VolumeDriver::Local,
+            VolumeDriverBody::S3 {
+                bucket,
+                prefix,
+                credential_ref,
+            } => temps_agents::sandbox::VolumeDriver::S3 {
+                bucket,
+                prefix,
+                credential_ref,
+            },
+        }
+    }
+}
+
+impl From<VolumeMountBody> for temps_agents::sandbox::VolumeMount {
+    fn from(m: VolumeMountBody) -> Self {
+        temps_agents::sandbox::VolumeMount {
+            volume: m.volume,
+            mount_path: m.mount_path,
+            driver: m.driver.into(),
+            read_only: m.read_only,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, ToSchema, Default)]
 pub struct CreateSandboxBody {
     /// Docker image override. `null` uses the platform default.
@@ -425,6 +485,11 @@ pub struct CreateSandboxBody {
     /// 400 rather than silently downgrading isolation.
     #[serde(default)]
     pub backend: Option<String>,
+    /// Additional volumes to mount at their own paths (ADR-034),
+    /// temps-native. A mount at the sandbox work dir replaces the default
+    /// ephemeral work dir with a volume that survives destroy.
+    #[serde(default)]
+    pub volumes: Vec<VolumeMountBody>,
 
     // ── `@vercel/sandbox` fields accepted for compatibility and ignored.
     // We accept them so SDK calls don't 422 on `deny_unknown_fields`; we
@@ -453,6 +518,7 @@ impl From<CreateSandboxBody> for CreateSandboxRequest {
             preview_password: b.preview_password,
             ports: b.ports,
             backend: b.backend,
+            volumes: b.volumes.into_iter().map(Into::into).collect(),
         }
     }
 }

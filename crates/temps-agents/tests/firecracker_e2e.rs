@@ -36,7 +36,7 @@ fn create_config(run_id: i32) -> SandboxCreateConfig {
         run_id,
         container_name_override: Some(format!("e2e{}", run_id)),
         host_work_dir: PathBuf::from("/tmp"),
-        workspace_volume: None,
+        volumes: Vec::new(),
         image: None, // provider default (alpine)
         cpu_limit: Some(1.0),
         memory_limit_mb: Some(256),

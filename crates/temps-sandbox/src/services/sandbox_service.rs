@@ -101,6 +101,11 @@ pub struct CreateSandboxRequest {
     /// it). Unknown values are a validation error, and requesting a
     /// backend the host doesn't have fails create rather than downgrading.
     pub backend: Option<String>,
+    /// Additional volumes to mount, at their own paths, alongside the
+    /// work dir (see ADR-034). Validated with
+    /// [`temps_agents::sandbox::volume::validate_mounts`] before any
+    /// DB/container work starts.
+    pub volumes: Vec<temps_agents::sandbox::VolumeMount>,
 }
 
 /// Output DTO — what the service returns to handlers and what handlers
@@ -593,6 +598,13 @@ impl SandboxService {
             }
         }
 
+        // Same fail-fast rule for volume mounts: bad paths/names/drivers
+        // are a 400, not a half-created sandbox.
+        temps_agents::sandbox::volume::validate_mounts(&req.volumes)
+            .map_err(|e| SandboxError::Validation {
+                message: e.to_string(),
+            })?;
+
         // Validate + hash the optional preview password *before* any
         // container/workdir work starts. A caller passing junk should fail
         // fast with a 400 rather than leaving an orphan container behind.
@@ -665,7 +677,7 @@ impl SandboxService {
             run_id: row.id,
             container_name_override: Some(container_label.clone()),
             host_work_dir,
-            workspace_volume: None,
+            volumes: req.volumes.clone(),
             image: req.image.clone(),
             cpu_limit: req.cpu_limit,
             memory_limit_mb: req.memory_limit_mb,
