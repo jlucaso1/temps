@@ -343,6 +343,9 @@ sudo systemctl status temps
 
 ### Memory Footprint and Transparent Huge Pages
 
+This section applies to Linux hosts only -- the settings and files it uses do
+not exist on macOS.
+
 The `temps` binary uses [jemalloc](https://jemalloc.net/) as its global
 allocator. jemalloc keeps up to `4 x CPU cores` independent arenas so that
 allocating threads rarely contend on the same one, and binds threads to them
@@ -368,7 +371,12 @@ Check the current setting:
 cat /sys/kernel/mm/transparent_hugepage/enabled
 # [always] madvise never   <- inflated RSS
 # always [madvise] never   <- nothing to do
+# always madvise [never]   <- nothing to do (THP off entirely)
 ```
+
+Only `always` is affected. Under both `madvise` and `never` the kernel stops
+handing out huge pages that nothing asked for, which is what causes the
+overhead below.
 
 Switching the host to `madvise` leaves THP available to processes that ask for
 it explicitly and stops the kernel from handing whole huge pages to processes
@@ -405,28 +413,38 @@ be hidden in swap:
 | `THP=always`  | 442 MB | 332 MB  | 190 MB           |
 | `THP=madvise` | 319 MB | 210 MB  | 0 MB             |
 
-Switching to `madvise` cut the resident set by 123 MB, about 28%. On that host
-190 MB of the 442 MB -- roughly 43% -- was huge pages backing sparsely used
-allocator regions. A 2-core VPS sees a much smaller absolute difference, because
-it uses at most a twelfth as many arenas.
+Switching to `madvise` cut the resident set by 123 MB, about 28%, against a
+run-to-run variance of roughly +/-40 MB on that host. These are two observed
+runs, not a repeated measurement, so treat 123 MB as the size of the effect
+rather than a saving you can budget for. On that host 190 MB of the 442 MB --
+roughly 43% -- was huge pages backing sparsely used allocator regions. A 2-core
+VPS sees a much smaller absolute difference, because it uses at most a twelfth
+as many arenas. Measure your own host rather than assuming a percentage.
 
 **Trade-off.** This is a host-wide kernel setting, not a Temps setting, so it
 applies to every process on the machine. It does not affect *explicit* huge
 pages: hugetlbfs reservations, including PostgreSQL's `huge_pages` setting, are
 a separate mechanism and keep working under `madvise`. PostgreSQL in fact
 [discourages THP](https://www.postgresql.org/docs/current/runtime-config-resource.html#RUNTIME-CONFIG-RESOURCE-MEMORY)
-and asks for huge pages explicitly instead. What you should check before
-flipping the host is whether some other workload on it relies on THP being
-granted without asking -- a JVM run with `-XX:+UseTransparentHugePages`, for
-example. If nothing on the host does, `madvise` is the safer default.
+and asks for huge pages explicitly instead. Workloads that ask for huge pages
+explicitly -- through `madvise(MADV_HUGEPAGE)` or hugetlbfs -- keep getting them
+under `madvise`. What you should check before flipping the host is whether
+anything on it depends on huge pages it never requested, since that is precisely
+what `always` provides and `madvise` withdraws. If nothing does, `madvise` is
+the safer default.
 
 **Verifying on your own host.** Reading another process's memory summary goes
 through the kernel's ptrace access checks, so unless you are running as the same
 user as the service, use `sudo`:
 
 ```bash
-sudo grep -E 'VmRSS|RssAnon|VmSwap' /proc/$(pidof temps)/status
-sudo grep AnonHugePages /proc/$(pidof temps)/smaps_rollup
+# Loop: in the split proxy/console topology both processes are named `temps`,
+# so `pidof temps` returns more than one PID.
+for pid in $(pidof temps); do
+  echo "== pid $pid: $(tr '\0' ' ' < /proc/$pid/cmdline)"
+  sudo grep -E 'VmRSS|RssAnon|VmSwap' /proc/$pid/status
+  sudo grep AnonHugePages /proc/$pid/smaps_rollup
+done
 ```
 
 Report `RssAnon` and `VmSwap` together: on a host with swap enabled, a falling
@@ -441,9 +459,12 @@ Two adjustments that look like they should replace the host setting do not:
   it did not reduce it at all and total RSS rose. It is not a substitute for the
   host setting.
 - Shrinking thread stacks with `RUST_MIN_STACK` does not touch this memory at
-  all: glibc already marks every thread stack `MADV_NOHUGEPAGE`, so stacks are
-  never huge-page backed. It only shifts the address-space layout, and has been
-  measured to raise resident memory substantially.
+  all: glibc already marks every thread stack `MADV_NOHUGEPAGE`, so on a glibc
+  build stacks are never huge-page backed (measured on glibc 2.39). It only
+  shifts the address-space layout, and has been measured to raise resident
+  memory substantially. The musl-based container image was not measured, so on
+  that packaging the stack behaviour is untested -- the arena effect above is
+  allocator-level and applies either way.
 
 ### Reverse Proxy (nginx)
 
