@@ -1,9 +1,11 @@
 use maxminddb::geoip2;
+use memmap2::Mmap;
 use rand::prelude::IndexedRandom;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::fs::File;
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 use thiserror::Error;
 use tracing::{debug, info, warn};
@@ -82,6 +84,8 @@ pub enum GeoIpError {
     NotFound(String),
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
+    #[error("MaxMind database at '{path}' is unusable: {reason}")]
+    DatabaseUnusable { path: String, reason: String },
     #[error("Other error: {0}")]
     Other(String),
 }
@@ -226,6 +230,123 @@ where
     Ok(loaded)
 }
 
+/// Matches the startup downloader's own floor: below this a file is truncated,
+/// not a database.
+const MIN_PLAUSIBLE_MMDB_BYTES: u64 = 1_000_000;
+
+/// Backing bytes for a `maxminddb::Reader`. `Mapped` is clean, evictable page
+/// cache; `Heap` is the anonymous fallback, identical to `Reader::open_readfile`.
+enum DatabaseSource {
+    Mapped(Mmap),
+    Heap(Vec<u8>),
+}
+
+impl AsRef<[u8]> for DatabaseSource {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Mapped(mmap) => mmap.as_ref(),
+            Self::Heap(buf) => buf.as_ref(),
+        }
+    }
+}
+
+impl DatabaseSource {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Mapped(_) => "mmap",
+            Self::Heap(_) => "heap",
+        }
+    }
+}
+
+/// Opens `path` and checks what `Mmap::map` requires but does not verify.
+///
+/// Metadata is read through the returned descriptor, so the checks apply to the
+/// inode that gets mapped and cannot be invalidated by a concurrent rename.
+fn open_verified_database(path: &Path) -> Result<(File, u64), GeoIpError> {
+    let file = File::open(path).map_err(|e| GeoIpError::DatabaseUnusable {
+        path: path.display().to_string(),
+        reason: format!("could not be opened: {e}"),
+    })?;
+
+    let metadata = file.metadata().map_err(|e| GeoIpError::DatabaseUnusable {
+        path: path.display().to_string(),
+        reason: format!("could not be stat'ed through its own descriptor: {e}"),
+    })?;
+
+    // Devices, FIFOs and procfs entries have no fixed length, so a mapping's
+    // bounds would not describe the data.
+    if !metadata.is_file() {
+        return Err(GeoIpError::DatabaseUnusable {
+            path: path.display().to_string(),
+            reason: format!(
+                "is not a regular file (found {:?}); refusing to map it",
+                metadata.file_type()
+            ),
+        });
+    }
+
+    let len = metadata.len();
+    if len < MIN_PLAUSIBLE_MMDB_BYTES {
+        return Err(GeoIpError::DatabaseUnusable {
+            path: path.display().to_string(),
+            reason: format!(
+                "is {len} bytes, below the {MIN_PLAUSIBLE_MMDB_BYTES}-byte minimum; \
+                 treating it as truncated"
+            ),
+        });
+    }
+
+    Ok((file, len))
+}
+
+/// Maps the database, falling back to a heap read if mapping is unavailable.
+///
+/// Read onto the heap, GeoLite2-City.mmdb is ~58 MiB of anonymous memory:
+/// always resident, reclaimable only via swap. Mapped, only the pages a lookup
+/// walks become resident and the kernel can drop them for free.
+fn load_database_source(path: &Path) -> Result<DatabaseSource, GeoIpError> {
+    let (file, len) = open_verified_database(path)?;
+
+    // SAFETY: mapping aliases bytes another process could change; shrinking the
+    // file would make access raise SIGBUS, rewriting it would break the
+    // immutability `&[u8]` promises. Discharged by:
+    // 1. `open_verified_database` confirmed a regular file of known length
+    //    through this very descriptor, so no check/map TOCTOU.
+    // 2. `Mmap` keeps its own descriptor, so the inode stays alive while mapped
+    //    even if the directory entry is replaced or removed.
+    // 3. The only writer, `download_geolite2_database_on_startup` in temps-cli,
+    //    streams to `.mmdb.tmp` and `rename`s over the path; by (2) this mapping
+    //    stays bound to the old inode, whose bytes never change.
+    // 4. Nothing reopens the database at runtime -- `GeoIpService::new` is
+    //    reached only from plugin registration, and there is no refresh job.
+    //
+    // Residual: an operator overwriting in place (`cp` truncates, `mv` does not)
+    // on a running server. Outside this process's control; see docs.
+    let mapped = unsafe { Mmap::map(&file) };
+
+    match mapped {
+        Ok(mmap) => {
+            // Deliberately no `advise(Random)`: measured cold, it trades 2.7 MB
+            // of resident pages for 2x lookup latency by suppressing readahead.
+            debug!("Mapped MaxMind database '{}' ({len} bytes)", path.display());
+            Ok(DatabaseSource::Mapped(mmap))
+        }
+        Err(e) => {
+            warn!(
+                "Could not memory-map '{}' ({e}); reading it instead, costing ~{} MiB anonymous",
+                path.display(),
+                len / (1024 * 1024)
+            );
+            let buf = std::fs::read(path).map_err(|e| GeoIpError::DatabaseUnusable {
+                path: path.display().to_string(),
+                reason: format!("could not be read after mapping failed: {e}"),
+            })?;
+            Ok(DatabaseSource::Heap(buf))
+        }
+    }
+}
+
 /// Resolves an mmdb filename the same way `validate_geolite2_database`
 /// (temps-cli's serve startup check) does: current working directory first,
 /// falling back to `TEMPS_DATA_DIR` if the CWD candidate doesn't exist. The
@@ -273,20 +394,22 @@ impl GeoIpService {
         let db_path = resolve_mmdb_path("GeoLite2-City.mmdb");
         let service = get_or_load(&LOADED_DATABASES, db_path.clone(), || {
             debug!("Loading MaxMind database from: {:?}", db_path);
-            let reader = maxminddb::Reader::open_readfile(&db_path).map_err(|e| {
-                GeoIpError::Other(format!(
-                    "Failed to open MaxMind database at '{}': {}",
-                    db_path.display(),
-                    e
-                ))
-            })?;
+            let source = load_database_source(&db_path)?;
+            let source_kind = source.kind();
+            let reader = maxminddb::Reader::from_source(source)?;
+            info!(
+                "Loaded MaxMind City database from {:?} ({source_kind})",
+                db_path
+            );
 
             // ASN database is optional: hosting-provider detection degrades gracefully
             // (asn_org/is_hosting_provider stay None) rather than failing startup when
             // the operator hasn't provisioned it, same as the City database's own
             // optional-file convention in Dockerfile/docker-compose.
             let asn_db_path = resolve_mmdb_path("GeoLite2-ASN.mmdb");
-            let asn_reader = match maxminddb::Reader::open_readfile(&asn_db_path) {
+            let asn_reader = match load_database_source(&asn_db_path)
+                .and_then(|source| Ok(maxminddb::Reader::from_source(source)?))
+            {
                 Ok(reader) => {
                     info!("Loaded MaxMind ASN database from: {:?}", asn_db_path);
                     Some(reader)
@@ -316,8 +439,8 @@ impl GeoIpService {
 }
 
 pub struct MaxMindGeoIpService {
-    reader: maxminddb::Reader<Vec<u8>>,
-    asn_reader: Option<maxminddb::Reader<Vec<u8>>>,
+    reader: maxminddb::Reader<DatabaseSource>,
+    asn_reader: Option<maxminddb::Reader<DatabaseSource>>,
 }
 
 impl MaxMindGeoIpService {
@@ -470,6 +593,60 @@ impl MockGeoIpService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_open_verified_database_rejects_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = open_verified_database(dir.path()).expect_err("a directory is not mappable");
+        let msg = err.to_string();
+        assert!(msg.contains("not a regular file"), "unexpected: {msg}");
+    }
+
+    #[test]
+    fn test_open_verified_database_rejects_truncated_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("GeoLite2-City.mmdb");
+        std::fs::write(&path, b"not a real database").expect("write");
+        let err = open_verified_database(&path).expect_err("a stub file is not a database");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("treating it as truncated"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_open_verified_database_reports_missing_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("absent.mmdb");
+        let err = open_verified_database(&path).expect_err("missing file");
+        let msg = err.to_string();
+        assert!(msg.contains("could not be opened"), "unexpected: {msg}");
+        assert!(
+            msg.contains("absent.mmdb"),
+            "error must name the path: {msg}"
+        );
+    }
+
+    /// Both variants must hand the reader the identical bytes, so the mmap and
+    /// fallback paths cannot diverge in what they parse.
+    #[test]
+    fn test_database_source_exposes_same_bytes_for_both_variants() {
+        let bytes = vec![1u8, 2, 3, 4, 5];
+        let heap = DatabaseSource::Heap(bytes.clone());
+        assert_eq!(heap.as_ref(), &bytes[..]);
+        assert_eq!(heap.kind(), "heap");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bytes.bin");
+        std::fs::write(&path, &bytes).expect("write");
+        let file = File::open(&path).expect("open");
+        // SAFETY: the file is created by this test, lives in a private temp dir
+        // that nothing else can reach, and is not written again while mapped.
+        let mapped = DatabaseSource::Mapped(unsafe { Mmap::map(&file) }.expect("map"));
+        assert_eq!(mapped.as_ref(), heap.as_ref());
+        assert_eq!(mapped.kind(), "mmap");
+    }
 
     /// A second load of the same database path must reuse the first reader
     /// rather than allocate another copy. This is the whole point of the memo:
