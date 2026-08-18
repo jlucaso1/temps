@@ -341,6 +341,131 @@ sudo systemctl start temps
 sudo systemctl status temps
 ```
 
+### Memory Footprint and Transparent Huge Pages
+
+This section applies to Linux hosts only -- the settings and files it uses do
+not exist on macOS.
+
+The `temps` binary uses [jemalloc](https://jemalloc.net/) as its global
+allocator. jemalloc keeps up to `4 x CPU cores` independent arenas so that
+allocating threads rarely contend on the same one, and binds threads to them
+lazily as they first allocate. Every arena that is used maps its own region from
+the kernel, and the kernel returns huge-page-aligned mappings when Transparent
+Huge Pages (THP) are enabled.
+
+When the host is set to `THP=always` -- the default on many distributions --
+touching a single byte inside such a window can fault in the whole huge page.
+An arena holding a few kilobytes of metadata is then charged the full huge page.
+The cost scales with the number of arenas actually used, not with how much
+memory Temps allocates, so it is most visible on many-core machines running a
+light workload.
+
+The figures below were measured on x86_64 with 4 KiB base pages, where a huge
+page is 2 MiB. On ARM64 the page geometry depends on the kernel's base page size
+(4 KiB, 16 KiB or 64 KiB), and the huge page can be considerably larger, so the
+absolute numbers do not carry over.
+
+Check the current setting:
+
+```bash
+cat /sys/kernel/mm/transparent_hugepage/enabled
+# [always] madvise never   <- inflated RSS
+# always [madvise] never   <- nothing to do
+# always madvise [never]   <- nothing to do (THP off entirely)
+```
+
+Only `always` is affected. Under both `madvise` and `never` the kernel stops
+handing out huge pages that nothing asked for, which is what causes the
+overhead below.
+
+Switching the host to `madvise` leaves THP available to processes that ask for
+it explicitly and stops the kernel from handing whole huge pages to processes
+that do not:
+
+```bash
+# Takes effect immediately, for every process started afterwards
+echo madvise | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
+```
+
+To persist it across reboots, add `transparent_hugepage=madvise` to the kernel
+command line. The command differs by distribution:
+
+```bash
+# Debian / Ubuntu -- edit GRUB_CMDLINE_LINUX in /etc/default/grub, then:
+sudo update-grub
+
+# RHEL / Amazon Linux -- no file to edit:
+sudo grubby --update-kernel=ALL --args="transparent_hugepage=madvise"
+
+# Other GRUB 2 systems -- edit GRUB_CMDLINE_LINUX in /etc/default/grub, then:
+sudo grub2-mkconfig -o /boot/grub2/grub.cfg
+```
+
+Restart Temps after changing the runtime setting -- it is applied when memory is
+mapped, so an already-running process keeps the huge pages it was given.
+
+**Measured effect.** On a 24-core x86_64 host, after an identical warmup, with
+swap disabled for the service (`MemorySwapMax=0`) so that resident memory cannot
+be hidden in swap:
+
+| Host setting  | VmRSS  | RssAnon | Huge-page backed |
+| ------------- | ------ | ------- | ---------------- |
+| `THP=always`  | 442 MB | 332 MB  | 190 MB           |
+| `THP=madvise` | 319 MB | 210 MB  | 0 MB             |
+
+Switching to `madvise` cut the resident set by 123 MB, about 28%, against a
+run-to-run variance of roughly +/-40 MB on that host. These are two observed
+runs, not a repeated measurement, so treat 123 MB as the size of the effect
+rather than a saving you can budget for. On that host 190 MB of the 442 MB --
+roughly 43% -- was huge pages backing sparsely used allocator regions. A 2-core
+VPS sees a much smaller absolute difference, because it uses at most a twelfth
+as many arenas. Measure your own host rather than assuming a percentage.
+
+**Trade-off.** This is a host-wide kernel setting, not a Temps setting, so it
+applies to every process on the machine. It does not affect *explicit* huge
+pages: hugetlbfs reservations, including PostgreSQL's `huge_pages` setting, are
+a separate mechanism and keep working under `madvise`. PostgreSQL in fact
+[discourages THP](https://www.postgresql.org/docs/current/runtime-config-resource.html#RUNTIME-CONFIG-RESOURCE-MEMORY)
+and asks for huge pages explicitly instead. Workloads that ask for huge pages
+explicitly -- through `madvise(MADV_HUGEPAGE)` or hugetlbfs -- keep getting them
+under `madvise`. What you should check before flipping the host is whether
+anything on it depends on huge pages it never requested, since that is precisely
+what `always` provides and `madvise` withdraws. If nothing does, `madvise` is
+the safer default.
+
+**Verifying on your own host.** Reading another process's memory summary goes
+through the kernel's ptrace access checks, so unless you are running as the same
+user as the service, use `sudo`:
+
+```bash
+# Loop: in the split proxy/console topology both processes are named `temps`,
+# so `pidof temps` returns more than one PID.
+for pid in $(pidof temps); do
+  echo "== pid $pid: $(tr '\0' ' ' < /proc/$pid/cmdline)"
+  sudo grep -E 'VmRSS|RssAnon|VmSwap' /proc/$pid/status
+  sudo grep AnonHugePages /proc/$pid/smaps_rollup
+done
+```
+
+Report `RssAnon` and `VmSwap` together: on a host with swap enabled, a falling
+RSS may only mean pages moved into swap.
+
+Two adjustments that look like they should replace the host setting do not:
+
+- jemalloc's `thp:never` does issue `MADV_NOHUGEPAGE`, but not over every
+  mapping the allocator ends up using, so a large share of the huge pages
+  survives it. Its net effect is host-dependent: in one controlled reproduction
+  it roughly halved the huge-page-backed memory, while on the 24-core host above
+  it did not reduce it at all and total RSS rose. It is not a substitute for the
+  host setting.
+- Shrinking thread stacks with `RUST_MIN_STACK` does not touch this memory at
+  all: glibc already marks every thread stack `MADV_NOHUGEPAGE`, so on a glibc
+  build stacks are never huge-page backed (measured on glibc 2.39). It only
+  shifts the address-space layout, and has been measured to raise resident
+  memory substantially. The musl-based container image was not measured, so on
+  that packaging the stack behaviour is untested -- the arena effect above is
+  allocator-level and applies either way.
+
 ### Reverse Proxy (nginx)
 
 If you're running behind nginx:
