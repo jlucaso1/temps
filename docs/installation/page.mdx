@@ -341,6 +341,87 @@ sudo systemctl start temps
 sudo systemctl status temps
 ```
 
+### Memory Footprint and Transparent Huge Pages
+
+The `temps` binary uses [jemalloc](https://jemalloc.net/) as its global
+allocator. jemalloc creates `4 x CPU cores` independent arenas so that
+allocating threads rarely contend on the same one. Every arena maps its own
+region from the kernel, and the kernel hands back 2 MiB-aligned mappings when
+Transparent Huge Pages (THP) are enabled.
+
+When the host is set to `THP=always` -- the default on many distributions --
+touching a single byte inside one of those 2 MiB windows faults in the whole
+2 MiB as one physical page. An arena that holds a few kilobytes of metadata is
+therefore charged 2 MiB of resident memory. The cost scales with core count,
+not with how much memory Temps actually allocates, so it is most visible on
+many-core machines running a light workload.
+
+Check the current setting:
+
+```bash
+cat /sys/kernel/mm/transparent_hugepage/enabled
+# [always] madvise never   <- inflated RSS
+# always [madvise] never   <- nothing to do
+```
+
+Switching the host to `madvise` leaves THP available to processes that ask for
+it explicitly and stops the kernel from handing whole huge pages to processes
+that do not:
+
+```bash
+# Takes effect immediately, for every process started afterwards
+echo madvise | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
+
+# Persist across reboots (GRUB)
+# Add transparent_hugepage=madvise to GRUB_CMDLINE_LINUX in /etc/default/grub
+sudo update-grub && sudo reboot
+```
+
+Restart Temps afterwards -- the setting is applied when memory is mapped, so an
+already-running process keeps the huge pages it was given.
+
+**Measured effect.** On a 24-core host, after an identical warmup, with swap
+disabled for the service (`MemorySwapMax=0`) so that resident memory cannot be
+hidden in swap:
+
+| Host setting  | VmRSS  | RssAnon | Huge-page backed |
+| ------------- | ------ | ------- | ---------------- |
+| `THP=always`  | 442 MB | 332 MB  | 190 MB           |
+| `THP=madvise` | 319 MB | 210 MB  | 0 MB             |
+
+Roughly a quarter of the resident set on that host was huge pages backing
+sparsely used allocator regions. A 2-core VPS sees a much smaller absolute
+difference, because it has a twelfth as many arenas.
+
+**Trade-off.** This is a host-wide kernel setting, not a Temps setting. Other
+workloads on the same machine may genuinely prefer `always` -- databases with
+large shared buffers, in particular, benefit from huge pages. If you run
+PostgreSQL or another memory-intensive service on the same host, measure both
+sides before changing it, or give Temps its own machine.
+
+**Verifying on your own host.** The install script grants the unit
+`AmbientCapabilities=CAP_NET_BIND_SERVICE` so Temps can bind ports 80 and 443
+as a non-root user. Ambient capabilities clear the process's `dumpable` flag,
+so on such an install `/proc/<pid>/smaps_rollup` is readable only by root:
+
+```bash
+sudo grep -E 'VmRSS|RssAnon|VmSwap' /proc/$(pidof temps)/status
+sudo grep AnonHugePages /proc/$(pidof temps)/smaps_rollup
+```
+
+Report `RssAnon` and `VmSwap` together: on a host with swap enabled, a falling
+RSS may only mean pages moved into swap.
+
+Two adjustments that look like they should help do not, and both have been
+measured to make things worse -- do not reach for them:
+
+- jemalloc's `thp:never` does issue `MADV_NOHUGEPAGE`, but not over every
+  mapping the allocator ends up using, so most of the huge pages survive it.
+- Shrinking thread stacks with `RUST_MIN_STACK` does not touch this memory at
+  all: glibc already marks every thread stack `MADV_NOHUGEPAGE`, so stacks are
+  never huge-page backed. It only shifts the address-space layout, and has been
+  measured to raise resident memory substantially.
+
 ### Reverse Proxy (nginx)
 
 If you're running behind nginx:
