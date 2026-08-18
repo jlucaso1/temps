@@ -1,9 +1,11 @@
 use maxminddb::geoip2;
+use memmap2::Mmap;
 use rand::prelude::IndexedRandom;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::fs::File;
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 use thiserror::Error;
 use tracing::{debug, info, warn};
@@ -82,6 +84,8 @@ pub enum GeoIpError {
     NotFound(String),
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
+    #[error("MaxMind database at '{path}' is unusable: {reason}")]
+    DatabaseUnusable { path: String, reason: String },
     #[error("Other error: {0}")]
     Other(String),
 }
@@ -226,6 +230,162 @@ where
     Ok(loaded)
 }
 
+/// Matches the startup downloader's own floor: below this a file is truncated,
+/// not a database.
+const MIN_PLAUSIBLE_MMDB_BYTES: u64 = 1_000_000;
+
+/// Backing bytes for a `maxminddb::Reader`. `Mapped` is clean, evictable page
+/// cache; `Heap` is the anonymous fallback, identical to `Reader::open_readfile`.
+enum DatabaseSource {
+    Mapped(Mmap),
+    Heap(Vec<u8>),
+}
+
+impl AsRef<[u8]> for DatabaseSource {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Mapped(mmap) => mmap.as_ref(),
+            Self::Heap(buf) => buf.as_ref(),
+        }
+    }
+}
+
+impl DatabaseSource {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Mapped(_) => "mmap",
+            Self::Heap(_) => "heap",
+        }
+    }
+}
+
+/// Opens `path` and checks what `Mmap::map` requires but does not verify.
+///
+/// Metadata is read through the returned descriptor, so the checks apply to the
+/// inode that gets mapped and cannot be invalidated by a concurrent rename.
+fn open_verified_database(path: &Path) -> Result<(File, u64), GeoIpError> {
+    let file = File::open(path).map_err(|e| GeoIpError::DatabaseUnusable {
+        path: path.display().to_string(),
+        reason: format!("could not be opened: {e}"),
+    })?;
+
+    let metadata = file.metadata().map_err(|e| GeoIpError::DatabaseUnusable {
+        path: path.display().to_string(),
+        reason: format!("could not be stat'ed through its own descriptor: {e}"),
+    })?;
+
+    // Devices, FIFOs and procfs entries have no fixed length, so a mapping's
+    // bounds would not describe the data.
+    if !metadata.is_file() {
+        return Err(GeoIpError::DatabaseUnusable {
+            path: path.display().to_string(),
+            reason: format!(
+                "is not a regular file (found {:?}); refusing to map it",
+                metadata.file_type()
+            ),
+        });
+    }
+
+    let len = metadata.len();
+    if len < MIN_PLAUSIBLE_MMDB_BYTES {
+        return Err(GeoIpError::DatabaseUnusable {
+            path: path.display().to_string(),
+            reason: format!(
+                "is {len} bytes, below the {MIN_PLAUSIBLE_MMDB_BYTES}-byte minimum; \
+                 treating it as truncated"
+            ),
+        });
+    }
+
+    Ok((file, len))
+}
+
+/// Copies `source` (`len` bytes) into an unnamed temporary file next to it.
+///
+/// `tempfile_in` never links the file into a directory, so nothing can open it
+/// by name -- which is what makes the mapping below safe to hold. It is created
+/// beside the database so the copy lands on the same filesystem as the data
+/// directory rather than on whatever backs `/tmp`.
+fn snapshot_database(source: &mut File, len: u64, dir: &Path) -> std::io::Result<File> {
+    let mut snapshot = tempfile::tempfile_in(dir)?;
+    let copied = std::io::copy(source, &mut snapshot)?;
+    if copied != len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("copied {copied} of {len} bytes"),
+        ));
+    }
+    Ok(snapshot)
+}
+
+/// Maps a private snapshot of the database, falling back to a heap read.
+///
+/// Read onto the heap, GeoLite2-City.mmdb is ~58 MiB of anonymous memory:
+/// always resident, reclaimable only via swap. Mapped, only the pages a lookup
+/// walks become resident and the kernel can drop them for free.
+///
+/// The mapping is taken over a copy rather than the operator's file. Mapping
+/// the original would make an in-place overwrite (`cp` truncates; `mv` does
+/// not) raise SIGBUS in this process, turning a stale database -- the previous
+/// behaviour -- into a crash. The copy costs one `len`-byte write per process
+/// and holds that much disk while the process runs.
+fn load_database_source(path: &Path) -> Result<DatabaseSource, GeoIpError> {
+    let (mut file, len) = open_verified_database(path)?;
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+
+    let snapshot = match snapshot_database(&mut file, len, dir) {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            warn!(
+                "Could not snapshot '{}' into {} ({e}); reading it instead, costing ~{} MiB \
+                 anonymous memory",
+                path.display(),
+                dir.display(),
+                len / (1024 * 1024)
+            );
+            return read_database_onto_heap(path);
+        }
+    };
+
+    // SAFETY: mapping is unsafe because the bytes may change underneath it --
+    // truncation raises SIGBUS on access, rewriting breaks the immutability
+    // `&[u8]` promises. `snapshot` cannot be either: `tempfile_in` returns a
+    // file that was never linked into any directory, so no path names it and no
+    // other process can open it to write or truncate. This process only ever
+    // reads it, and the descriptor outlives the mapping. (Root can still reach
+    // it via /proc/<pid>/fd, but root can already ptrace the process.)
+    let mapped = unsafe { Mmap::map(&snapshot) };
+
+    match mapped {
+        Ok(mmap) => {
+            // Deliberately no `advise(Random)`: measured cold, it trades 2.7 MB
+            // of resident pages for 2x lookup latency by suppressing readahead.
+            debug!(
+                "Mapped a private snapshot of '{}' ({len} bytes)",
+                path.display()
+            );
+            Ok(DatabaseSource::Mapped(mmap))
+        }
+        Err(e) => {
+            warn!(
+                "Could not memory-map the snapshot of '{}' ({e}); reading it instead, costing \
+                 ~{} MiB anonymous memory",
+                path.display(),
+                len / (1024 * 1024)
+            );
+            read_database_onto_heap(path)
+        }
+    }
+}
+
+fn read_database_onto_heap(path: &Path) -> Result<DatabaseSource, GeoIpError> {
+    let buf = std::fs::read(path).map_err(|e| GeoIpError::DatabaseUnusable {
+        path: path.display().to_string(),
+        reason: format!("could not be read: {e}"),
+    })?;
+    Ok(DatabaseSource::Heap(buf))
+}
+
 /// Resolves an mmdb filename the same way `validate_geolite2_database`
 /// (temps-cli's serve startup check) does: current working directory first,
 /// falling back to `TEMPS_DATA_DIR` if the CWD candidate doesn't exist. The
@@ -273,20 +433,22 @@ impl GeoIpService {
         let db_path = resolve_mmdb_path("GeoLite2-City.mmdb");
         let service = get_or_load(&LOADED_DATABASES, db_path.clone(), || {
             debug!("Loading MaxMind database from: {:?}", db_path);
-            let reader = maxminddb::Reader::open_readfile(&db_path).map_err(|e| {
-                GeoIpError::Other(format!(
-                    "Failed to open MaxMind database at '{}': {}",
-                    db_path.display(),
-                    e
-                ))
-            })?;
+            let source = load_database_source(&db_path)?;
+            let source_kind = source.kind();
+            let reader = maxminddb::Reader::from_source(source)?;
+            info!(
+                "Loaded MaxMind City database from {:?} ({source_kind})",
+                db_path
+            );
 
             // ASN database is optional: hosting-provider detection degrades gracefully
             // (asn_org/is_hosting_provider stay None) rather than failing startup when
             // the operator hasn't provisioned it, same as the City database's own
             // optional-file convention in Dockerfile/docker-compose.
             let asn_db_path = resolve_mmdb_path("GeoLite2-ASN.mmdb");
-            let asn_reader = match maxminddb::Reader::open_readfile(&asn_db_path) {
+            let asn_reader = match load_database_source(&asn_db_path)
+                .and_then(|source| Ok(maxminddb::Reader::from_source(source)?))
+            {
                 Ok(reader) => {
                     info!("Loaded MaxMind ASN database from: {:?}", asn_db_path);
                     Some(reader)
@@ -316,8 +478,8 @@ impl GeoIpService {
 }
 
 pub struct MaxMindGeoIpService {
-    reader: maxminddb::Reader<Vec<u8>>,
-    asn_reader: Option<maxminddb::Reader<Vec<u8>>>,
+    reader: maxminddb::Reader<DatabaseSource>,
+    asn_reader: Option<maxminddb::Reader<DatabaseSource>>,
 }
 
 impl MaxMindGeoIpService {
@@ -470,6 +632,88 @@ impl MockGeoIpService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The regression this snapshot exists for: overwriting the operator's file
+    /// in place (what `cp` does) must not disturb the mapping. Mapping the
+    /// original directly, this read raises SIGBUS and kills the process.
+    #[test]
+    fn test_mapping_survives_in_place_overwrite_of_the_source() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("GeoLite2-City.mmdb");
+        let contents = vec![0xABu8; 2 * 1024 * 1024];
+        std::fs::write(&path, &contents).expect("write");
+
+        let source = load_database_source(&path).expect("load");
+        assert_eq!(source.kind(), "mmap", "expected the snapshot to be mapped");
+
+        // Exactly what `cp new.mmdb <path>` does: truncate, then write less.
+        let mut clobber = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .expect("reopen");
+        clobber.write_all(b"clobbered").expect("clobber");
+        drop(clobber);
+
+        assert_eq!(source.as_ref().len(), contents.len());
+        assert_eq!(source.as_ref(), &contents[..]);
+    }
+
+    #[test]
+    fn test_open_verified_database_rejects_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = open_verified_database(dir.path()).expect_err("a directory is not mappable");
+        let msg = err.to_string();
+        assert!(msg.contains("not a regular file"), "unexpected: {msg}");
+    }
+
+    #[test]
+    fn test_open_verified_database_rejects_truncated_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("GeoLite2-City.mmdb");
+        std::fs::write(&path, b"not a real database").expect("write");
+        let err = open_verified_database(&path).expect_err("a stub file is not a database");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("treating it as truncated"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_open_verified_database_reports_missing_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("absent.mmdb");
+        let err = open_verified_database(&path).expect_err("missing file");
+        let msg = err.to_string();
+        assert!(msg.contains("could not be opened"), "unexpected: {msg}");
+        assert!(
+            msg.contains("absent.mmdb"),
+            "error must name the path: {msg}"
+        );
+    }
+
+    /// Both variants must hand the reader the identical bytes, so the mmap and
+    /// fallback paths cannot diverge in what they parse.
+    #[test]
+    fn test_database_source_exposes_same_bytes_for_both_variants() {
+        let bytes = vec![1u8, 2, 3, 4, 5];
+        let heap = DatabaseSource::Heap(bytes.clone());
+        assert_eq!(heap.as_ref(), &bytes[..]);
+        assert_eq!(heap.kind(), "heap");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bytes.bin");
+        std::fs::write(&path, &bytes).expect("write");
+        let file = File::open(&path).expect("open");
+        // SAFETY: the file is created by this test, lives in a private temp dir
+        // that nothing else can reach, and is not written again while mapped.
+        let mapped = DatabaseSource::Mapped(unsafe { Mmap::map(&file) }.expect("map"));
+        assert_eq!(mapped.as_ref(), heap.as_ref());
+        assert_eq!(mapped.kind(), "mmap");
+    }
 
     /// A second load of the same database path must reuse the first reader
     /// rather than allocate another copy. This is the whole point of the memo:
