@@ -300,51 +300,90 @@ fn open_verified_database(path: &Path) -> Result<(File, u64), GeoIpError> {
     Ok((file, len))
 }
 
-/// Maps the database, falling back to a heap read if mapping is unavailable.
+/// Copies `source` (`len` bytes) into an unnamed temporary file next to it.
+///
+/// `tempfile_in` never links the file into a directory, so nothing can open it
+/// by name -- which is what makes the mapping below safe to hold. It is created
+/// beside the database so the copy lands on the same filesystem as the data
+/// directory rather than on whatever backs `/tmp`.
+fn snapshot_database(source: &mut File, len: u64, dir: &Path) -> std::io::Result<File> {
+    let mut snapshot = tempfile::tempfile_in(dir)?;
+    let copied = std::io::copy(source, &mut snapshot)?;
+    if copied != len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("copied {copied} of {len} bytes"),
+        ));
+    }
+    Ok(snapshot)
+}
+
+/// Maps a private snapshot of the database, falling back to a heap read.
 ///
 /// Read onto the heap, GeoLite2-City.mmdb is ~58 MiB of anonymous memory:
 /// always resident, reclaimable only via swap. Mapped, only the pages a lookup
 /// walks become resident and the kernel can drop them for free.
+///
+/// The mapping is taken over a copy rather than the operator's file. Mapping
+/// the original would make an in-place overwrite (`cp` truncates; `mv` does
+/// not) raise SIGBUS in this process, turning a stale database -- the previous
+/// behaviour -- into a crash. The copy costs one `len`-byte write per process
+/// and holds that much disk while the process runs.
 fn load_database_source(path: &Path) -> Result<DatabaseSource, GeoIpError> {
-    let (file, len) = open_verified_database(path)?;
+    let (mut file, len) = open_verified_database(path)?;
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
 
-    // SAFETY: mapping aliases bytes another process could change; shrinking the
-    // file would make access raise SIGBUS, rewriting it would break the
-    // immutability `&[u8]` promises. Discharged by:
-    // 1. `open_verified_database` confirmed a regular file of known length
-    //    through this very descriptor, so no check/map TOCTOU.
-    // 2. `Mmap` keeps its own descriptor, so the inode stays alive while mapped
-    //    even if the directory entry is replaced or removed.
-    // 3. The only writer, `download_geolite2_database_on_startup` in temps-cli,
-    //    streams to `.mmdb.tmp` and `rename`s over the path; by (2) this mapping
-    //    stays bound to the old inode, whose bytes never change.
-    // 4. Nothing reopens the database at runtime -- `GeoIpService::new` is
-    //    reached only from plugin registration, and there is no refresh job.
-    //
-    // Residual: an operator overwriting in place (`cp` truncates, `mv` does not)
-    // on a running server. Outside this process's control; see docs.
-    let mapped = unsafe { Mmap::map(&file) };
+    let snapshot = match snapshot_database(&mut file, len, dir) {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            warn!(
+                "Could not snapshot '{}' into {} ({e}); reading it instead, costing ~{} MiB \
+                 anonymous memory",
+                path.display(),
+                dir.display(),
+                len / (1024 * 1024)
+            );
+            return read_database_onto_heap(path);
+        }
+    };
+
+    // SAFETY: mapping is unsafe because the bytes may change underneath it --
+    // truncation raises SIGBUS on access, rewriting breaks the immutability
+    // `&[u8]` promises. `snapshot` cannot be either: `tempfile_in` returns a
+    // file that was never linked into any directory, so no path names it and no
+    // other process can open it to write or truncate. This process only ever
+    // reads it, and the descriptor outlives the mapping. (Root can still reach
+    // it via /proc/<pid>/fd, but root can already ptrace the process.)
+    let mapped = unsafe { Mmap::map(&snapshot) };
 
     match mapped {
         Ok(mmap) => {
             // Deliberately no `advise(Random)`: measured cold, it trades 2.7 MB
             // of resident pages for 2x lookup latency by suppressing readahead.
-            debug!("Mapped MaxMind database '{}' ({len} bytes)", path.display());
+            debug!(
+                "Mapped a private snapshot of '{}' ({len} bytes)",
+                path.display()
+            );
             Ok(DatabaseSource::Mapped(mmap))
         }
         Err(e) => {
             warn!(
-                "Could not memory-map '{}' ({e}); reading it instead, costing ~{} MiB anonymous",
+                "Could not memory-map the snapshot of '{}' ({e}); reading it instead, costing \
+                 ~{} MiB anonymous memory",
                 path.display(),
                 len / (1024 * 1024)
             );
-            let buf = std::fs::read(path).map_err(|e| GeoIpError::DatabaseUnusable {
-                path: path.display().to_string(),
-                reason: format!("could not be read after mapping failed: {e}"),
-            })?;
-            Ok(DatabaseSource::Heap(buf))
+            read_database_onto_heap(path)
         }
     }
+}
+
+fn read_database_onto_heap(path: &Path) -> Result<DatabaseSource, GeoIpError> {
+    let buf = std::fs::read(path).map_err(|e| GeoIpError::DatabaseUnusable {
+        path: path.display().to_string(),
+        reason: format!("could not be read: {e}"),
+    })?;
+    Ok(DatabaseSource::Heap(buf))
 }
 
 /// Resolves an mmdb filename the same way `validate_geolite2_database`
@@ -593,6 +632,34 @@ impl MockGeoIpService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The regression this snapshot exists for: overwriting the operator's file
+    /// in place (what `cp` does) must not disturb the mapping. Mapping the
+    /// original directly, this read raises SIGBUS and kills the process.
+    #[test]
+    fn test_mapping_survives_in_place_overwrite_of_the_source() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("GeoLite2-City.mmdb");
+        let contents = vec![0xABu8; 2 * 1024 * 1024];
+        std::fs::write(&path, &contents).expect("write");
+
+        let source = load_database_source(&path).expect("load");
+        assert_eq!(source.kind(), "mmap", "expected the snapshot to be mapped");
+
+        // Exactly what `cp new.mmdb <path>` does: truncate, then write less.
+        let mut clobber = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .expect("reopen");
+        clobber.write_all(b"clobbered").expect("clobber");
+        drop(clobber);
+
+        assert_eq!(source.as_ref().len(), contents.len());
+        assert_eq!(source.as_ref(), &contents[..]);
+    }
 
     #[test]
     fn test_open_verified_database_rejects_directory() {
