@@ -932,6 +932,22 @@ fn create_swagger_router(plugin_manager: &PluginManager) -> anyhow::Result<Route
     Ok(plugin_manager.apply_middleware_to_router(swagger_guarded, plugin_manager.get_middleware()))
 }
 
+/// Response compression for every console listener.
+///
+/// Temps' reference deployment is a small shared-vCPU box, and the console's
+/// two biggest page-load costs are the JS bundle and a handful of JSON list
+/// payloads -- both text, both compressing 4-10x. `CompressionLevel::Fastest`
+/// is deliberate: on a burstable instance the CPU to compress at a higher level
+/// costs more than the bytes it saves, whereas level-1 gzip runs at hundreds of
+/// MB/s and pays for itself on any link slower than a datacentre LAN.
+///
+/// `DefaultPredicate` already skips responses under 32 bytes, already-compressed
+/// image/video types, gRPC, and `text/event-stream` -- the last one matters
+/// here, because buffering the deployment log stream would break live tailing.
+fn compression_layer() -> tower_http::compression::CompressionLayer {
+    tower_http::compression::CompressionLayer::new().quality(tower_http::CompressionLevel::Fastest)
+}
+
 /// Static file handler for embedded website
 async fn serve_static_file(req: Request) -> Response {
     serve_static_from(website(), req)
@@ -941,6 +957,67 @@ async fn serve_static_file(req: Request) -> Response {
 /// listener when the root bundle has been overridden by an embedding binary).
 async fn serve_original_console(req: Request) -> Response {
     serve_static_from(&WEBSITE, req)
+}
+
+/// Cache-Control for a static asset, by path.
+///
+/// Hashed assets (JS/CSS bundles from Rsbuild) get aggressive caching.
+/// `index.html` and other non-hashed files must revalidate every time so
+/// deploying a new Temps version immediately picks up new bundle references.
+fn cache_control_for(path: &str) -> &'static str {
+    if path == "index.html" || path == "/" {
+        // `no-cache` (revalidate before every use), deliberately WITHOUT
+        // `no-store`. `no-store` forbids the browser from keeping a copy at
+        // all, so it can never send `If-None-Match` and every page load
+        // re-downloads the document. `no-cache` gives the same freshness
+        // guarantee while letting the conditional GET below answer 304.
+        "no-cache, must-revalidate"
+    } else if path.starts_with("static/") || path.starts_with("assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "public, max-age=0, must-revalidate"
+    }
+}
+
+/// Whether `path` is content-hashed by the bundler, so its bytes can never
+/// change without the path changing too.
+fn is_content_hashed(path: &str) -> bool {
+    path.starts_with("static/") || path.starts_with("assets/")
+}
+
+/// Strong ETag for an embedded static file.
+///
+/// For content-hashed bundles the filename already identifies the bytes, so the
+/// path alone is hashed -- re-hashing a multi-megabyte bundle on every request
+/// would be pure waste on the shared-vCPU hosts Temps targets. Everything else
+/// (notably `index.html`, the one file that revalidates on every page load) is
+/// small, so its contents are hashed directly and the ETag changes exactly when
+/// the file does.
+fn etag_for(path: &str, contents: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    if is_content_hashed(path) {
+        path.hash(&mut hasher);
+    } else {
+        contents.hash(&mut hasher);
+    }
+    format!("\"{:016x}\"", hasher.finish())
+}
+
+/// Whether an `If-None-Match` header value matches `etag`.
+///
+/// Handles the comma-separated list form and the `W/` weak prefix, plus the
+/// `*` wildcard. Comparison is weak (RFC 9110 §13.1.2 mandates weak comparison
+/// for `If-None-Match`), which is what lets a compressed and an identity
+/// response share one ETag.
+fn if_none_match_matches(header_value: &str, etag: &str) -> bool {
+    header_value.split(',').any(|candidate| {
+        let candidate = candidate.trim();
+        if candidate == "*" {
+            return true;
+        }
+        candidate.strip_prefix("W/").unwrap_or(candidate) == etag
+    })
 }
 
 fn serve_static_from(site: &'static Dir<'static>, req: Request) -> Response {
@@ -970,40 +1047,39 @@ fn serve_static_from(site: &'static Dir<'static>, req: Request) -> Response {
 
     debug!("Attempting to serve static file: {}", path);
 
+    // Drives the conditional-GET check below. Borrowed straight from the
+    // request -- no allocation on a path that serves every asset of every page
+    // load.
+    let if_none_match = req
+        .headers()
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok());
+
     match site.get_file(path) {
         Some(file) => {
             let mime_type = mime_guess::from_path(path)
                 .first_or_octet_stream()
                 .to_string();
 
-            // Hashed assets (JS/CSS bundles from Rsbuild) get aggressive caching.
-            // index.html and other non-hashed files must revalidate every time so
-            // deploying a new Temps version immediately picks up new bundle references.
-            let cache_control = if path == "index.html" || path == "/" {
-                "no-cache, no-store, must-revalidate"
-            } else if path.starts_with("static/") || path.starts_with("assets/") {
-                "public, max-age=31536000, immutable"
-            } else {
-                "public, max-age=0, must-revalidate"
-            };
-
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, mime_type)
-                .header(header::CACHE_CONTROL, cache_control)
-                .body(Body::from(file.contents()))
-                .unwrap()
+            static_response(
+                path,
+                &mime_type,
+                cache_control_for(path),
+                file.contents(),
+                if_none_match,
+            )
         }
         None => {
             // If file not found, try serving index.html (for SPA routing)
             if let Some(index) = site.get_file("index.html") {
                 debug!("File not found, serving index.html for SPA routing");
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "text/html")
-                    .header(header::CACHE_CONTROL, "no-cache")
-                    .body(Body::from(index.contents()))
-                    .unwrap()
+                static_response(
+                    "index.html",
+                    "text/html",
+                    cache_control_for("index.html"),
+                    index.contents(),
+                    if_none_match,
+                )
             } else {
                 debug!("File not found and no index.html available: {}", path);
                 Response::builder()
@@ -1013,6 +1089,39 @@ fn serve_static_from(site: &'static Dir<'static>, req: Request) -> Response {
             }
         }
     }
+}
+
+/// Build a static-asset response, answering `304 Not Modified` when the
+/// browser's `If-None-Match` already matches.
+///
+/// The 304 path is what makes a warm reload cheap: `index.html` is
+/// `no-cache`, so every page load revalidates it, and without an ETag that
+/// revalidation shipped the whole document plus the CPU to serialize it.
+fn static_response(
+    path: &str,
+    mime_type: &str,
+    cache_control: &str,
+    contents: &'static [u8],
+    if_none_match: Option<&str>,
+) -> Response {
+    let etag = etag_for(path, contents);
+
+    if if_none_match.is_some_and(|value| if_none_match_matches(value, &etag)) {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(header::ETAG, &etag)
+            .header(header::CACHE_CONTROL, cache_control)
+            .body(Body::empty())
+            .unwrap();
+    }
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, mime_type)
+        .header(header::CACHE_CONTROL, cache_control)
+        .header(header::ETAG, &etag)
+        .body(Body::from(contents))
+        .unwrap()
 }
 
 /// Source URL for downloading GeoLite2-City.mmdb when missing on startup.
@@ -3007,7 +3116,8 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let public_app = Router::new()
         .merge(health_router(ready_flag.clone()))
         .nest("/api", public_router)
-        .layer(axum::middleware::from_fn(track_server_errors));
+        .layer(axum::middleware::from_fn(track_server_errors))
+        .layer(compression_layer());
 
     // Platform-console listener: when an embedding binary overrode the root
     // bundle AND configured an address, serve the ORIGINAL console (same
@@ -3022,7 +3132,8 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let admin_app = Router::new()
         .nest("/api", admin_router)
         .fallback(serve_static_file)
-        .layer(axum::middleware::from_fn(track_server_errors));
+        .layer(axum::middleware::from_fn(track_server_errors))
+        .layer(compression_layer());
 
     // Defense-in-depth: the Pingora proxy is now the primary enforcer (it
     // 404s gated requests before they ever reach this listener). The axum
@@ -3041,6 +3152,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             .nest("/api", router)
             .fallback(serve_original_console)
             .layer(axum::middleware::from_fn(track_server_errors))
+            .layer(compression_layer())
             .layer(axum::middleware::from_fn_with_state(
                 admin_gate_handle.clone(),
                 super::admin_gate::admin_gate,
@@ -3174,6 +3286,208 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
 
     info!("Console API server exited");
     Ok(())
+}
+
+#[cfg(test)]
+mod static_asset_tests {
+    use super::*;
+
+    #[test]
+    fn index_html_is_revalidated_but_storable() {
+        // `no-store` would forbid the browser from keeping a copy, so it could
+        // never send `If-None-Match` and every page load would re-download the
+        // document. That is exactly the regression this asserts against.
+        let cc = cache_control_for("index.html");
+        assert!(cc.contains("no-cache"), "index.html must revalidate: {cc}");
+        assert!(
+            !cc.contains("no-store"),
+            "index.html must remain storable so conditional GETs work: {cc}"
+        );
+    }
+
+    #[test]
+    fn hashed_bundles_are_immutable() {
+        assert_eq!(
+            cache_control_for("static/js/main.abc123.js"),
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(
+            cache_control_for("assets/logo.deadbeef.svg"),
+            "public, max-age=31536000, immutable"
+        );
+    }
+
+    #[test]
+    fn unhashed_files_must_revalidate() {
+        assert_eq!(
+            cache_control_for("robots.txt"),
+            "public, max-age=0, must-revalidate"
+        );
+    }
+
+    #[test]
+    fn etag_of_unhashed_file_tracks_its_contents() {
+        let a = etag_for("index.html", b"<html>v1</html>");
+        let b = etag_for("index.html", b"<html>v2</html>");
+        assert_ne!(
+            a, b,
+            "a new console build must produce a new index.html ETag"
+        );
+        assert_eq!(a, etag_for("index.html", b"<html>v1</html>"));
+    }
+
+    #[test]
+    fn etag_of_hashed_bundle_tracks_its_path_only() {
+        // The bundler already put a content hash in the filename, so hashing
+        // megabytes of bundle per request would buy nothing.
+        let a = etag_for("static/js/main.abc123.js", b"contents-A");
+        let b = etag_for("static/js/main.abc123.js", b"contents-B");
+        assert_eq!(a, b);
+        assert_ne!(a, etag_for("static/js/main.def456.js", b"contents-A"));
+    }
+
+    #[test]
+    fn etag_is_a_quoted_token() {
+        let etag = etag_for("index.html", b"body");
+        assert!(etag.starts_with('"') && etag.ends_with('"'), "{etag}");
+    }
+
+    #[test]
+    fn if_none_match_handles_lists_weak_tags_and_wildcard() {
+        let etag = "\"00112233aabbccdd\"";
+        assert!(if_none_match_matches(etag, etag));
+        assert!(if_none_match_matches("*", etag));
+        assert!(if_none_match_matches(&format!("W/{etag}"), etag));
+        assert!(if_none_match_matches(
+            &format!("\"other\", {etag}, \"another\""),
+            etag
+        ));
+        assert!(!if_none_match_matches("\"other\"", etag));
+        assert!(!if_none_match_matches("", etag));
+    }
+
+    #[test]
+    fn matching_if_none_match_yields_304_with_no_body() {
+        let body = b"<html>hello</html>";
+        let etag = etag_for("index.html", body);
+
+        let response = static_response("index.html", "text/html", "no-cache", body, Some(&etag));
+
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(response.headers().get(header::ETAG).unwrap(), etag.as_str());
+        // A 304 must not carry the entity it is telling the client to reuse.
+        assert!(response.headers().get(header::CONTENT_TYPE).is_none());
+    }
+
+    #[test]
+    fn stale_if_none_match_yields_200_with_etag() {
+        let body = b"<html>hello</html>";
+
+        let response = static_response(
+            "index.html",
+            "text/html",
+            "no-cache",
+            body,
+            Some("\"stale-etag\""),
+        );
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::ETAG).unwrap(),
+            etag_for("index.html", body).as_str()
+        );
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html"
+        );
+    }
+
+    #[test]
+    fn absent_if_none_match_yields_200() {
+        let response = static_response("index.html", "text/html", "no-cache", b"hi", None);
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+mod compression_tests {
+    use super::*;
+    use axum::routing::get;
+    use tower::ServiceExt; // for `oneshot`
+
+    async fn chatty_json() -> Response {
+        // Roughly the shape and size of one of the console's list endpoints.
+        let body = r#"{"items":[{"id":1,"name":"placeholder","status":"active"}]}"#.repeat(40);
+        Response::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    async fn log_stream() -> Response {
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from("data: line\n\n".repeat(80)))
+            .unwrap()
+    }
+
+    fn request(uri: &str, accept_encoding: Option<&str>) -> Request {
+        let mut builder = Request::builder().uri(uri);
+        if let Some(encoding) = accept_encoding {
+            builder = builder.header(header::ACCEPT_ENCODING, encoding);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn json_responses_are_compressed_for_capable_clients() {
+        let app = Router::new()
+            .route("/list", get(chatty_json))
+            .layer(compression_layer());
+
+        let response = app
+            .oneshot(request("/list", Some("gzip")))
+            .await
+            .expect("router responded");
+
+        assert_eq!(
+            response.headers().get(header::CONTENT_ENCODING).unwrap(),
+            "gzip"
+        );
+    }
+
+    #[tokio::test]
+    async fn clients_without_accept_encoding_get_the_body_untouched() {
+        let app = Router::new()
+            .route("/list", get(chatty_json))
+            .layer(compression_layer());
+
+        let response = app
+            .oneshot(request("/list", None))
+            .await
+            .expect("router responded");
+
+        assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+    }
+
+    #[tokio::test]
+    async fn event_streams_are_never_compressed() {
+        // Compressing an SSE body buffers it, which would stall live log
+        // tailing in the deployment view until the stream ended.
+        let app = Router::new()
+            .route("/logs", get(log_stream))
+            .layer(compression_layer());
+
+        let response = app
+            .oneshot(request("/logs", Some("gzip, br")))
+            .await
+            .expect("router responded");
+
+        assert!(
+            response.headers().get(header::CONTENT_ENCODING).is_none(),
+            "text/event-stream must pass through uncompressed"
+        );
+    }
 }
 
 #[cfg(test)]
