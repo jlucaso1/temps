@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'bun:test'
 import { getProjectsOptions } from '@/api/client/@tanstack/react-query.gen'
-import { PROJECTS_PREVIEW_PER_PAGE } from '@/contexts/ProjectsContext'
+import {
+  PROJECTS_PREVIEW_PER_PAGE,
+  projectsPreviewQueryOptions,
+} from '@/lib/projects-preview-query'
 import { shouldFetchActivationSignals } from './useGettingStarted'
 
 describe('shouldFetchActivationSignals', () => {
@@ -21,20 +24,25 @@ describe('shouldFetchActivationSignals', () => {
 })
 
 describe('projects query deduplication', () => {
-  test('the activation probe and the app-wide preview share a query key', () => {
+  test('the shared options key differs from the old per_page: 1 probe', () => {
     // TanStack Query dedupes by query key, and the key includes the request
-    // params. When these two drift apart (they used to: per_page 1 vs 4) the
-    // console issues two near-identical GET /projects on every page load.
-    const preview = getProjectsOptions({
-      query: { page: 1, per_page: PROJECTS_PREVIEW_PER_PAGE },
-    }).queryKey
-    const probe = getProjectsOptions({
-      query: { page: 1, per_page: PROJECTS_PREVIEW_PER_PAGE },
-    }).queryKey
+    // params. When the two call sites drift apart (they used to: per_page 1 vs
+    // 4) the console issues two near-identical GET /projects per page load.
+    const shared = projectsPreviewQueryOptions().queryKey
 
-    expect(probe).toEqual(preview)
+    expect(shared).toEqual(
+      getProjectsOptions({
+        query: { page: 1, per_page: PROJECTS_PREVIEW_PER_PAGE },
+      }).queryKey
+    )
     expect(
       getProjectsOptions({ query: { page: 1, per_page: 1 } }).queryKey
-    ).not.toEqual(preview)
+    ).not.toEqual(shared)
+  })
+
+  test('the shared options carry a stale window, so one load is one request', () => {
+    // Aligning the key is not enough on its own: the two observers mount a few
+    // hundred ms apart, and at staleTime 0 the later one refetches immediately.
+    expect(projectsPreviewQueryOptions().staleTime).toBeGreaterThan(0)
   })
 })

@@ -2,7 +2,6 @@ import { useQuery } from '@tanstack/react-query'
 import {
   listConnectionsOptions,
   listDomainsOptions,
-  getProjectsOptions,
   listNotificationProvidersOptions,
   listServicesOptions,
   listBackupSchedulesOptions,
@@ -11,7 +10,7 @@ import {
   getAiProviderStatusOptions,
   listApiKeysOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import { PROJECTS_PREVIEW_PER_PAGE } from '@/contexts/ProjectsContext'
+import { projectsPreviewQueryOptions } from '@/lib/projects-preview-query'
 import { useSettings } from './useSettings'
 import { SIMULATE_EMPTY_INSTALL } from '@/lib/devSimulate'
 import { getAiHarnessStatus } from '@/lib/ai-onboarding'
@@ -90,15 +89,12 @@ export function useActivationSignals(
     retry: false,
   })
 
-  // Deliberately the SAME page size `ProjectsContext` asks for. TanStack Query
-  // dedupes by query key and the key includes the params, so the old
-  // `per_page: 1` here produced a second, near-identical `GET /projects` on
-  // every page load purely because the numbers differed. All this needs is "is
-  // there at least one project", which the first page of the list answers.
+  // Shares `ProjectsContext`'s exact options, so the two observers resolve to
+  // one request. All this needs is "is there at least one project", which the
+  // first page of that list already answers -- asking for a different page
+  // size here bought nothing and cost a second `GET /projects`.
   const { data: projectsData, isLoading: projectsLoading } = useQuery({
-    ...getProjectsOptions({
-      query: { page: 1, per_page: PROJECTS_PREVIEW_PER_PAGE },
-    }),
+    ...projectsPreviewQueryOptions(),
     enabled,
     retry: false,
   })

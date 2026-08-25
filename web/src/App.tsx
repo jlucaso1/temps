@@ -1027,20 +1027,21 @@ const queryClient = new QueryClient({
   }),
   defaultOptions: {
     queries: {
-      // Temps is routinely self-hosted on a 1 GB / shared-vCPU box where the
-      // console and Postgres share the machine. TanStack Query's defaults
-      // (staleTime: 0, retry: 3) mean every mount of every component refetches
-      // immediately, so a single navigation fanned out into 20+ parallel
-      // requests -- past the browser's 6-connection HTTP/1.1 limit, and enough
-      // concurrent queries to spike load average on a burstable instance.
+      // Deliberately NO global `staleTime`. It is tempting on the small
+      // shared-vCPU hosts Temps is self-hosted on, but this app's dominant
+      // idiom is "mutate, then navigate to the list": ~26 components run a
+      // create/update mutation and `navigate()` away without invalidating the
+      // destination's query, relying on refetch-on-mount to show the result.
+      // A non-zero default silently breaks every one of them -- e.g. adding a
+      // notification provider lands back on /settings/notifications showing a
+      // list that does not contain it. Caching here is safe only per-query,
+      // where the reader knows the invalidation story: see `listPresets`
+      // (1h), `getAccessInfo` (5m), `getFeatureMaturity` (Infinity) and
+      // `usePlugins` (5m), all read-only platform facts.
       //
-      // 30s is short enough that anything the user changes elsewhere in the app
-      // is still picked up on the next navigation, and every mutation that
-      // matters already invalidates its queries explicitly, so this does not
-      // make the UI stale after a write.
-      staleTime: 30 * 1000,
-      // Keep results around long enough that back-navigation within a session
-      // renders from cache instead of re-hitting the API.
+      // Keep results in memory after their last observer unmounts. This is
+      // retention, not freshness -- a remount still refetches -- so it costs
+      // no correctness.
       gcTime: 5 * 60 * 1000,
       refetchOnWindowFocus: false,
       // Three retries turns one failing endpoint into four requests. On a
