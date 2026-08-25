@@ -1027,7 +1027,26 @@ const queryClient = new QueryClient({
   }),
   defaultOptions: {
     queries: {
+      // Temps is routinely self-hosted on a 1 GB / shared-vCPU box where the
+      // console and Postgres share the machine. TanStack Query's defaults
+      // (staleTime: 0, retry: 3) mean every mount of every component refetches
+      // immediately, so a single navigation fanned out into 20+ parallel
+      // requests -- past the browser's 6-connection HTTP/1.1 limit, and enough
+      // concurrent queries to spike load average on a burstable instance.
+      //
+      // 30s is short enough that anything the user changes elsewhere in the app
+      // is still picked up on the next navigation, and every mutation that
+      // matters already invalidates its queries explicitly, so this does not
+      // make the UI stale after a write.
+      staleTime: 30 * 1000,
+      // Keep results around long enough that back-navigation within a session
+      // renders from cache instead of re-hitting the API.
+      gcTime: 5 * 60 * 1000,
       refetchOnWindowFocus: false,
+      // Three retries turns one failing endpoint into four requests. On a
+      // constrained host a timeout is usually a symptom of load, and retrying
+      // hard makes it worse.
+      retry: 1,
     },
     mutations: {
       onError: (error: unknown, _variables, context) => {
