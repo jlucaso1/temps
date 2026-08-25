@@ -12,12 +12,53 @@ export interface GettingStartedItem {
   cta: string
 }
 
-export function useGettingStarted() {
+export interface UseGettingStartedOptions {
+  /**
+   * Force the underlying activation queries to run even when the checklist has
+   * been dismissed. The dedicated setup page passes this because it renders the
+   * checklist regardless of the dismissal flag; everywhere else the default
+   * applies and a dismissed checklist costs zero requests.
+   */
+  alwaysFetch?: boolean
+}
+
+/**
+ * Whether the ten activation-signal queries should run.
+ *
+ * Extracted so the gate itself is covered by a test: getting this wrong is
+ * invisible in the UI (a dismissed checklist renders nothing either way) and
+ * silently costs ten HTTP requests on every single navigation.
+ */
+export function shouldFetchActivationSignals(
+  dismissed: boolean,
+  alwaysFetch: boolean
+): boolean {
+  return alwaysFetch || !dismissed
+}
+
+/**
+ * Drives the onboarding checklist: the ordered setup items, how many are done,
+ * and whether the checklist should be on screen at all.
+ *
+ * Dismissal is persisted in `localStorage` and gates the underlying activation
+ * queries, so a dismissed checklist costs nothing per navigation. Pass
+ * `alwaysFetch` when rendering the checklist regardless of that flag.
+ */
+export function useGettingStarted(options: UseGettingStartedOptions = {}) {
   const [dismissed, setDismissed] = useState(
     () => localStorage.getItem(DISMISSED_KEY) === 'true'
   )
 
-  const signals = useActivationSignals()
+  // A dismissed checklist renders nothing, so there is no reason to pay for the
+  // ten listing requests behind it. Before this gate they fired on every single
+  // navigation -- the largest single contributor to the page-load request
+  // storm, and completely invisible to the user who had already dismissed it.
+  const signals = useActivationSignals({
+    enabled: shouldFetchActivationSignals(
+      dismissed,
+      options.alwaysFetch === true
+    ),
+  })
 
   const items: GettingStartedItem[] = [
     {

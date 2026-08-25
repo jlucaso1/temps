@@ -14,10 +14,26 @@ export type {
   ScreenshotSettings as Screenshots,
 } from '@/api/client/types.gen'
 
-export function useSettings() {
+export interface UseSettingsOptions {
+  /**
+   * Set to false to keep the query from running. Used by consumers that only
+   * need settings when a feature is actually on screen (e.g. the onboarding
+   * checklist once it has been dismissed), so they stop contributing a request
+   * to every page load.
+   */
+  enabled?: boolean
+}
+
+/**
+ * Reads the platform settings record. Cached for five minutes -- these change
+ * only when an operator edits them, and `useUpdateSettings` writes the new
+ * value straight into the cache, so a longer stale window costs no freshness.
+ */
+export function useSettings(options: UseSettingsOptions = {}) {
   return useQuery({
     queryKey: ['platform-settings'],
     queryFn: getPlatformSettings,
+    enabled: options.enabled ?? true,
     staleTime: 5 * 60 * 1000, // 5 minutes
     retry: 1,
   })

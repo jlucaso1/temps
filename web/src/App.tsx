@@ -1027,7 +1027,27 @@ const queryClient = new QueryClient({
   }),
   defaultOptions: {
     queries: {
+      // Deliberately NO global `staleTime`. It is tempting on the small
+      // shared-vCPU hosts Temps is self-hosted on, but this app's dominant
+      // idiom is "mutate, then navigate to the list": ~26 components run a
+      // create/update mutation and `navigate()` away without invalidating the
+      // destination's query, relying on refetch-on-mount to show the result.
+      // A non-zero default silently breaks every one of them -- e.g. adding a
+      // notification provider lands back on /settings/notifications showing a
+      // list that does not contain it. Caching here is safe only per-query,
+      // where the reader knows the invalidation story: see `listPresets`
+      // (1h), `getAccessInfo` (5m), `getFeatureMaturity` (Infinity) and
+      // `usePlugins` (5m), all read-only platform facts.
+      //
+      // Keep results in memory after their last observer unmounts. This is
+      // retention, not freshness -- a remount still refetches -- so it costs
+      // no correctness.
+      gcTime: 5 * 60 * 1000,
       refetchOnWindowFocus: false,
+      // Three retries turns one failing endpoint into four requests. On a
+      // constrained host a timeout is usually a symptom of load, and retrying
+      // hard makes it worse.
+      retry: 1,
     },
     mutations: {
       onError: (error: unknown, _variables, context) => {

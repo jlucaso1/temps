@@ -1,5 +1,5 @@
 import { ProjectResponse } from '@/api/client'
-import { getProjectsOptions } from '@/api/client/@tanstack/react-query.gen'
+import { projectsPreviewQueryOptions } from '@/lib/projects-preview-query'
 import { useQuery } from '@tanstack/react-query'
 import { createContext, useContext } from 'react'
 
@@ -14,14 +14,7 @@ const ProjectsContext = createContext<ProjectsContextType>({
 })
 
 export function ProjectsProvider({ children }: { children: React.ReactNode }) {
-  const { data, isLoading } = useQuery({
-    ...getProjectsOptions({
-      query: {
-        page: 1,
-        per_page: 4,
-      },
-    }),
-  })
+  const { data, isLoading } = useQuery(projectsPreviewQueryOptions())
 
   return (
     <ProjectsContext.Provider

@@ -2,7 +2,6 @@ import { useQuery } from '@tanstack/react-query'
 import {
   listConnectionsOptions,
   listDomainsOptions,
-  getProjectsOptions,
   listNotificationProvidersOptions,
   listServicesOptions,
   listBackupSchedulesOptions,
@@ -11,6 +10,7 @@ import {
   getAiProviderStatusOptions,
   listApiKeysOptions,
 } from '@/api/client/@tanstack/react-query.gen'
+import { projectsPreviewQueryOptions } from '@/lib/projects-preview-query'
 import { useSettings } from './useSettings'
 import { SIMULATE_EMPTY_INSTALL } from '@/lib/devSimulate'
 import { getAiHarnessStatus } from '@/lib/ai-onboarding'
@@ -47,58 +47,99 @@ export interface ActivationSignals {
 
 const TOTAL = 10
 
-export function useActivationSignals(): ActivationSignals {
-  const { data: settings, isLoading: settingsLoading } = useSettings()
+export interface UseActivationSignalsOptions {
+  /**
+   * When false, none of the ten listing queries behind these signals run.
+   * Callers that only render the checklist when it is visible (see
+   * `useGettingStarted`) pass `false` once it has been dismissed -- that is
+   * what keeps a dismissed checklist from costing ten HTTP requests on every
+   * navigation.
+   */
+  enabled?: boolean
+}
+
+/**
+ * The ten "has the operator set this up yet" signals behind the onboarding
+ * checklist, each derived from a listing endpoint.
+ *
+ * Disabled (`{ enabled: false }`) this runs no queries at all: every signal
+ * comes back `false` and `isLoaded` stays `false`, so a caller can tell "not
+ * fetched" apart from "fetched, nothing configured". Callers that render the
+ * checklist conditionally should disable it rather than ignore the result --
+ * the queries cost ten HTTP requests per page load either way.
+ */
+export function useActivationSignals(
+  options: UseActivationSignalsOptions = {}
+): ActivationSignals {
+  const enabled = options.enabled ?? true
+
+  const { data: settings, isLoading: settingsLoading } = useSettings({
+    enabled,
+  })
 
   const { data: connections, isLoading: connectionsLoading } = useQuery({
     ...listConnectionsOptions({}),
+    enabled,
     retry: false,
   })
 
   const { data: domainsData, isLoading: domainsLoading } = useQuery({
     ...listDomainsOptions({ query: { page_size: 50 } }),
+    enabled,
     retry: false,
   })
 
+  // Shares `ProjectsContext`'s exact options, so the two observers resolve to
+  // one request. All this needs is "is there at least one project", which the
+  // first page of that list already answers -- asking for a different page
+  // size here bought nothing and cost a second `GET /projects`.
   const { data: projectsData, isLoading: projectsLoading } = useQuery({
-    ...getProjectsOptions({ query: { page: 1, per_page: 1 } }),
+    ...projectsPreviewQueryOptions(),
+    enabled,
     retry: false,
   })
 
   const { data: providersData, isLoading: providersLoading } = useQuery({
     ...listNotificationProvidersOptions({}),
+    enabled,
     retry: false,
   })
 
   const { data: servicesData, isLoading: servicesLoading } = useQuery({
     ...listServicesOptions({}),
+    enabled,
     retry: false,
   })
 
   const { data: backupSchedulesData, isLoading: backupSchedulesLoading } =
     useQuery({
       ...listBackupSchedulesOptions({}),
+      enabled,
       retry: false,
     })
 
   const { data: dnsProvidersData, isLoading: dnsProvidersLoading } = useQuery({
     ...listDnsProvidersOptions({}),
+    enabled,
     retry: false,
   })
 
   const { data: usersData, isLoading: usersLoading } = useQuery({
     ...listUsersOptions({ query: { include_deleted: false } }),
+    enabled,
     retry: false,
   })
 
   const { data: aiProviderStatus, isLoading: aiProviderStatusLoading } =
     useQuery({
       ...getAiProviderStatusOptions(),
+      enabled,
       retry: false,
     })
 
   const { data: apiKeysData, isLoading: apiKeysLoading } = useQuery({
     ...listApiKeysOptions({ query: { page: 1, page_size: 100 } }),
+    enabled,
     retry: false,
   })
 
@@ -124,7 +165,12 @@ export function useActivationSignals(): ActivationSignals {
     }
   }
 
+  // With the queries disabled nothing is in flight, so every `isLoading` is
+  // false -- reporting "loaded" from that would be a lie, and callers use
+  // `isLoaded` to decide whether the checklist may render. A disabled hook has
+  // no signals to show, so it is never loaded.
   const isLoaded =
+    enabled &&
     !settingsLoading &&
     !connectionsLoading &&
     !domainsLoading &&
