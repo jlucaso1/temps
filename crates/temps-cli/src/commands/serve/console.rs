@@ -972,17 +972,45 @@ fn cache_control_for(path: &str) -> &'static str {
         // re-downloads the document. `no-cache` gives the same freshness
         // guarantee while letting the conditional GET below answer 304.
         "no-cache, must-revalidate"
-    } else if path.starts_with("static/") || path.starts_with("assets/") {
+    } else if is_content_hashed(path) {
         "public, max-age=31536000, immutable"
     } else {
         "public, max-age=0, must-revalidate"
     }
 }
 
-/// Whether `path` is content-hashed by the bundler, so its bytes can never
-/// change without the path changing too.
+/// Whether `path` is content-hashed by the bundler, so its bytes cannot change
+/// without the path changing too.
+///
+/// Requires BOTH a bundler output directory and a hash in the filename. The
+/// directory alone is not enough: the root bundle can be replaced wholesale by
+/// an embedding binary (`set_embedded_ui`), and a replacement that ships an
+/// unhashed `assets/logo.svg` would otherwise be served `immutable` for a year
+/// and given an ETag derived from its unchanging path -- so an upgrade that
+/// changed those bytes could never reach a browser that had cached them.
+///
+/// Deliberately only ever *narrows* what is treated as immutable relative to
+/// the directory check it replaces, so no asset that used to revalidate stops
+/// doing so.
 fn is_content_hashed(path: &str) -> bool {
-    path.starts_with("static/") || path.starts_with("assets/")
+    if !path.starts_with("static/") && !path.starts_with("assets/") {
+        return false;
+    }
+    let file_name = path.rsplit('/').next().unwrap_or(path);
+
+    // `name.<hash>.ext` -- drop the extension and the leading name, then look
+    // for a hash-shaped segment in what is left. Rsbuild emits 8 hex
+    // characters (`index.af9fa11f.js`); accept any run of 8 or more so a
+    // longer digest still counts.
+    let mut segments: Vec<&str> = file_name.split('.').collect();
+    if segments.len() < 3 {
+        return false;
+    }
+    segments.pop();
+    segments.remove(0);
+    segments
+        .iter()
+        .any(|seg| seg.len() >= 8 && seg.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 /// Strong ETag for an embedded static file.
@@ -3308,13 +3336,55 @@ mod static_asset_tests {
     #[test]
     fn hashed_bundles_are_immutable() {
         assert_eq!(
-            cache_control_for("static/js/main.abc123.js"),
+            cache_control_for("static/js/index.af9fa11f.js"),
             "public, max-age=31536000, immutable"
         );
         assert_eq!(
             cache_control_for("assets/logo.deadbeef.svg"),
             "public, max-age=31536000, immutable"
         );
+    }
+
+    #[test]
+    fn unhashed_files_under_asset_dirs_are_not_immutable() {
+        // A replacement UI installed through `set_embedded_ui` can ship
+        // unhashed files under these directories. Serving those `immutable`
+        // for a year -- with an ETag derived from the unchanging path -- would
+        // strand the old bytes in every browser that cached them.
+        for path in [
+            "assets/logo.svg",
+            "static/css/main.css",
+            "static/js/app.min.js",
+            "assets/fonts/inter.woff2",
+        ] {
+            assert!(!is_content_hashed(path), "{path} must not count as hashed");
+            assert_eq!(
+                cache_control_for(path),
+                "public, max-age=0, must-revalidate"
+            );
+        }
+    }
+
+    #[test]
+    fn unhashed_asset_etags_track_contents() {
+        // The corollary: because it is not content-hashed, its validator has
+        // to come from the bytes, so an upgrade changes it.
+        let a = etag_for("assets/logo.svg", b"<svg>old</svg>");
+        let b = etag_for("assets/logo.svg", b"<svg>new</svg>");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn hash_detection_needs_a_hash_shaped_segment() {
+        assert!(is_content_hashed("static/js/index.af9fa11f.js"));
+        assert!(is_content_hashed("static/js/async/2168.4b2c3353.js"));
+        assert!(is_content_hashed("static/css/index.88cc9b29.css"));
+        // Too short to be a digest, and not hex.
+        assert!(!is_content_hashed("static/js/app.min.js"));
+        assert!(!is_content_hashed("static/js/main.abc123.js"));
+        // Right shape, wrong directory -- never widen beyond the bundler's
+        // own output dirs.
+        assert!(!is_content_hashed("vendor/index.af9fa11f.js"));
     }
 
     #[test]
@@ -3340,10 +3410,10 @@ mod static_asset_tests {
     fn etag_of_hashed_bundle_tracks_its_path_only() {
         // The bundler already put a content hash in the filename, so hashing
         // megabytes of bundle per request would buy nothing.
-        let a = etag_for("static/js/main.abc123.js", b"contents-A");
-        let b = etag_for("static/js/main.abc123.js", b"contents-B");
+        let a = etag_for("static/js/index.af9fa11f.js", b"contents-A");
+        let b = etag_for("static/js/index.af9fa11f.js", b"contents-B");
         assert_eq!(a, b);
-        assert_ne!(a, etag_for("static/js/main.def456.js", b"contents-A"));
+        assert_ne!(a, etag_for("static/js/index.88cc9b29.js", b"contents-A"));
     }
 
     #[test]
