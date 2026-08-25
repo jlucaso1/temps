@@ -24,6 +24,11 @@ export interface UseSettingsOptions {
   enabled?: boolean
 }
 
+/**
+ * Reads the platform settings record. Cached for five minutes -- these change
+ * only when an operator edits them, and `useUpdateSettings` writes the new
+ * value straight into the cache, so a longer stale window costs no freshness.
+ */
 export function useSettings(options: UseSettingsOptions = {}) {
   return useQuery({
     queryKey: ['platform-settings'],

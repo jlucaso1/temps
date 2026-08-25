@@ -36,6 +36,14 @@ export function shouldFetchActivationSignals(
   return alwaysFetch || !dismissed
 }
 
+/**
+ * Drives the onboarding checklist: the ordered setup items, how many are done,
+ * and whether the checklist should be on screen at all.
+ *
+ * Dismissal is persisted in `localStorage` and gates the underlying activation
+ * queries, so a dismissed checklist costs nothing per navigation. Pass
+ * `alwaysFetch` when rendering the checklist regardless of that flag.
+ */
 export function useGettingStarted(options: UseGettingStartedOptions = {}) {
   const [dismissed, setDismissed] = useState(
     () => localStorage.getItem(DISMISSED_KEY) === 'true'

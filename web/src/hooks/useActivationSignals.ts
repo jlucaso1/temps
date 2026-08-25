@@ -59,6 +59,16 @@ export interface UseActivationSignalsOptions {
   enabled?: boolean
 }
 
+/**
+ * The ten "has the operator set this up yet" signals behind the onboarding
+ * checklist, each derived from a listing endpoint.
+ *
+ * Disabled (`{ enabled: false }`) this runs no queries at all: every signal
+ * comes back `false` and `isLoaded` stays `false`, so a caller can tell "not
+ * fetched" apart from "fetched, nothing configured". Callers that render the
+ * checklist conditionally should disable it rather than ignore the result --
+ * the queries cost ten HTTP requests per page load either way.
+ */
 export function useActivationSignals(
   options: UseActivationSignalsOptions = {}
 ): ActivationSignals {
