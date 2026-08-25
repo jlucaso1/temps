@@ -127,7 +127,7 @@ export function Setup() {
   const navigate = useNavigate()
   const { setBreadcrumbs } = useBreadcrumbs()
   const { items, completedCount, totalCount, allDone, isLoaded } =
-    useGettingStarted()
+    useGettingStarted({ alwaysFetch: true })
   const signals = useActivationSignals()
 
   useEffect(() => {
